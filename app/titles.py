@@ -2,6 +2,7 @@ import os
 import re
 
 import titledb
+from containers import archive
 from constants import *
 from utils import *
 from settings import *
@@ -56,10 +57,22 @@ def get_title_id_from_app_id(app_id, app_type):
     return title_id.upper()
 
 def get_file_size(filepath):
+    """Size of the content a library path serves: for a RAR, the container inside it."""
+    if is_archive_path(filepath):
+        return archive.member(filepath)[1]
     return os.path.getsize(filepath)
 
 def get_file_info(filepath):
     filedir, filename = os.path.split(filepath)
+    size = None
+    if is_archive_path(filepath):
+        # The row describes what clients get, the container, while filepath stays the archive.
+        try:
+            filename, size = archive.member(filepath)
+        except Exception as e:
+            # Not every RAR in a library holds a game; one that doesn't must not stop a scan.
+            logger.warning(f'Skipping archive {filepath}: {e}')
+            return None
     extension = filename.split('.')[-1]
     
     compressed = False
@@ -72,7 +85,7 @@ def get_file_info(filepath):
         'filename': filename,
         'extension': extension,
         'compressed': compressed,
-        'size': get_file_size(filepath),
+        'size': get_file_size(filepath) if size is None else size,
         'mtime': os.path.getmtime(filepath),
     }
 

@@ -17,8 +17,9 @@ import shutil
 import logging
 import datetime
 from constants import *
-from flask import request, send_from_directory
-from utils import throttle, client_address
+from flask import request, send_from_directory, abort, Response
+from werkzeug.exceptions import RequestedRangeNotSatisfiable
+from utils import throttle, client_address, is_archive_path
 import titledb
 
 # Retrieve main logger
@@ -496,10 +497,11 @@ def update_file_path(library, old_path, new_path):
 
         # Extract the new folder and filename from the new_path
         folder = os.path.dirname(new_path)
-        filename = os.path.basename(new_path)
+        # An archive's row is named after the container inside it, which a move leaves be.
+        if not is_archive_path(new_path):
+            file_entry.filename = os.path.basename(new_path)
 
         # Update the file entry with the new path values
-        file_entry.filename = filename
         file_entry.filepath = new_path
         file_entry.folder = folder
         
@@ -795,12 +797,38 @@ def increment_download_count_throttled(filepath, host):
     increment_download_count(filepath)
 
 
+def _send_archived_file(filepath):
+    """Serve the container inside a RAR, decompressed as it is sent, ranges included."""
+    from containers import archive
+
+    try:
+        size = archive.member(filepath)[1]
+    except Exception as e:
+        logger.error(f"Cannot serve '{filepath}': {e}")
+        abort(404)
+    headers = {'Accept-Ranges': 'bytes'}
+    start, stop, status = 0, size, 200
+    if request.range is not None:
+        bounds = request.range.range_for_length(size)
+        if bounds is None:
+            raise RequestedRangeNotSatisfiable(length=size)
+        start, stop = bounds
+        status = 206
+        headers['Content-Range'] = f'bytes {start}-{stop - 1}/{size}'
+    headers['Content-Length'] = str(stop - start)
+    return Response(archive.stream(filepath, start, stop), status=status, headers=headers,
+                    mimetype='application/octet-stream', direct_passthrough=True)
+
+
 def send_library_file(filepath):
     """Serve a library file to the requesting client and count the download."""
-    filedir, filename = os.path.split(filepath)
     # Count only once the response exists: clients probe files with a Range before taking
     # them, and a range past the end of the file raises out of here without transferring.
-    response = send_from_directory(filedir, filename)
+    if is_archive_path(filepath):
+        response = _send_archived_file(filepath)
+    else:
+        filedir, filename = os.path.split(filepath)
+        response = send_from_directory(filedir, filename)
     increment_download_count_throttled(filepath, client_address(request))
     return response
 

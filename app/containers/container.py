@@ -15,6 +15,7 @@ from nsz.nut import Print as _nsz_print
 
 from constants import APP_TYPE_MAP
 
+from . import archive
 from .nacp import DEFAULT_LANGUAGE, read_control
 
 logger = logging.getLogger('main')
@@ -26,13 +27,28 @@ _Pfs0.Print.silent = True
 
 @contextmanager
 def open_container(filepath, meta_only=False):
-    """Open an NSP/NSZ/XCI/XCZ for reading, closed however the caller leaves."""
+    """Open an NSP/NSZ/XCI/XCZ for reading, closed however the caller leaves.
+
+    A RAR opens as the container it carries, read out of the archive as it decompresses.
+    """
     path = Path(filepath)
+    reader = None
+    if archive.is_archive_path(path):
+        name, _ = archive.member(path)
+        path = Path(name)
+        reader = archive.CachedReader(archive.MemberReader(str(filepath)))
     container = _factory(path.with_suffix(path.suffix.lower()))
     if type(container) not in (_Nsp.Nsp, _Xci.Xci):
+        if reader is not None:
+            reader.close()
         raise ValueError(f'Unsupported container extension: {path.suffix}')
     try:
-        container.open(str(filepath), 'rb', meta_only=meta_only)
+        if reader is None:
+            container.open(str(filepath), 'rb', meta_only=meta_only)
+        else:
+            # nsz only opens str paths itself; handed an already-set file it reads through it.
+            container.f, container.size, container._path = reader, reader.size, str(filepath)
+            container.open(None, 'rb', meta_only=meta_only)
         yield container
     finally:
         container.flush()

@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 import media
 import titles as titles_lib
+from containers import archive
 import sys
 from pathlib import Path
 from utils import *
@@ -64,6 +65,9 @@ def organized_path(file_obj, library_path, organizer_settings):
     return os.path.join(library_path, os.path.join(*safe_parts))
 
 def organize_file(file_obj, library_path, organizer_settings):
+    if is_archive_path(file_obj.filepath):
+        # A RAR set is several files named after one another; renaming one would break it.
+        return
     try:
         current_filepath = file_obj.filepath
         new_full_path = organized_path(file_obj, library_path, organizer_settings)
@@ -294,6 +298,8 @@ def delete_library_file(file_obj):
     if not os.path.exists(file_obj.filepath):
         logger.warning(f"Physical file not found for deletion: {file_obj.filepath}")
         return
+    if is_archive_path(file_obj.filepath):
+        _delete_archive_volumes(file_obj.filepath)
     add_ignored_event(file_obj.filepath, '')
     try:
         os.remove(file_obj.filepath)
@@ -302,6 +308,25 @@ def delete_library_file(file_obj):
         pop_ignored_event(src_path=file_obj.filepath, dest_path='')
         return
     delete_file_by_filepath(file_obj.filepath)
+
+
+def _delete_archive_volumes(first_volume):
+    """Remove every volume of a RAR set but the first, which the caller removes with the row.
+
+    The later volumes are no library files, so the watcher ignores their deletion anyway.
+    """
+    try:
+        paths = archive.volumes(first_volume)
+    except Exception as e:
+        logger.warning(f"Could not list the volumes of {first_volume}: {e}")
+        return
+    for path in paths:
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(first_volume)):
+            continue
+        try:
+            os.remove(path)
+        except OSError as e:
+            logger.error(f"Error deleting archive volume {path}: {e}")
 
 def duplicate_groups(prefer_multicontent, is_pending):
     """Per app losing a copy: its Apps.id, the copy kept, and its copies deleted - files whose

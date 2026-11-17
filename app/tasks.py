@@ -26,7 +26,7 @@ from db import (
     upsert_media, get_title_media, delete_media_slots, get_extract_version,
 )
 from settings import get_settings, local_media_enabled
-from utils import interval_string_to_timedelta, delete_empty_folders, human_size
+from utils import interval_string_to_timedelta, delete_empty_folders, human_size, is_archive_path
 from library import (
     add_missing_apps_for_title, update_title_flags,
     add_missing_apps_to_db, update_titles, organize_file,
@@ -831,6 +831,9 @@ def _needs_verify(file, mgmt):
     verification = mgmt['verification']
     if not verification['enabled'] or file.extension not in verification_lib.VERIFY_EXT:
         return False
+    if is_archive_path(file.filepath):
+        # nstools opens files by path; an archive's container has none.
+        return False
     if not titles_lib.Keys.keys_loaded:
         return False
     if verification['depth'] == verification_lib.DEPTH_HASH:
@@ -840,6 +843,8 @@ def _needs_verify(file, mgmt):
 
 
 def _needs_organize(file, mgmt):
+    if is_archive_path(file.filepath):
+        return False
     return mgmt['organizer']['enabled'] and file.identified and not file.organized
 
 
@@ -862,6 +867,8 @@ def _organize(file, mgmt):
 
 def _needs_compress(file, mgmt):
     if not mgmt['compression']['enabled'] or file.compressed or file.extension not in COMPRESS_EXT:
+        return False
+    if is_archive_path(file.filepath):
         return False
     if verification_status(file) == verification_lib.STATUS_CORRUPT:
         return False
@@ -1080,6 +1087,8 @@ def verify_file_task(file_id, manual=False, **kwargs):
     file_obj = db.session.get(Files, file_id)
     if not file_obj or file_obj.extension not in verification_lib.VERIFY_EXT:
         return
+    if is_archive_path(file_obj.filepath):
+        return
     if not os.path.exists(file_obj.filepath):
         return
     opts = get_settings()['library']['management']['verification']
@@ -1154,6 +1163,8 @@ def compress_file_task(file_id, manual=False, **kwargs):
     file_obj = db.session.get(Files, file_id)
     if not file_obj or file_obj.compressed or file_obj.extension not in COMPRESS_EXT:
         return
+    if is_archive_path(file_obj.filepath):
+        return
     if not os.path.exists(file_obj.filepath):
         return
     logger.info(f'Compressing file: {file_obj.filename}')
@@ -1172,6 +1183,8 @@ def decompress_file_task(file_id, **kwargs):
     """Decompress a single file in place: NSZ->NSP / XCZ->XCI, preserving its DB row."""
     file_obj = db.session.get(Files, file_id)
     if not file_obj or not file_obj.compressed or file_obj.extension not in DECOMPRESS_EXT:
+        return
+    if is_archive_path(file_obj.filepath):
         return
     if not os.path.exists(file_obj.filepath):
         return

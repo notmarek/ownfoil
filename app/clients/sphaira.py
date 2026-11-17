@@ -7,6 +7,7 @@ from flask import Request, Response
 
 from .client import BaseClient
 from db import db, Files, Libraries, send_library_file
+from sqlalchemy import and_, or_
 from constants import APP_TYPE_FILTERS, ALLOWED_EXTENSIONS
 
 # Sphaira announces itself as `Sphaira/<version>` since version 1.0.6.
@@ -90,7 +91,8 @@ class SphairaClient(BaseClient):
             library = Libraries.query.filter_by(id=file.library_id).first()
             
             library_path = library.path.rstrip('/' + os.sep)
-            file_path = file.filepath
+            # Listed by the name it is served as: a RAR's row names the container inside it.
+            file_path = os.path.join(file.folder, file.filename)
 
             # Strip library path to get relative path, in the url form the listing is built in:
             # filepaths come off the filesystem in its own separator.
@@ -140,9 +142,12 @@ class SphairaClient(BaseClient):
         if paths[0] in APP_TYPE_FILTERS:
             paths = paths[1:]
         # The listing merges every library into one tree, so the path may lie under any of them.
-        candidates = [os.path.join(library.path, *paths) for library in Libraries.query.all()]
-        filepath = db.session.query(Files.filepath).filter(
-            Files.filepath.in_(candidates)).order_by(Files.id).limit(1).scalar()
+        candidates = [os.path.split(os.path.join(library.path, *paths))
+                      for library in Libraries.query.all()]
+        # Matched on folder and name, which for a RAR is the container's, not the archive's.
+        filepath = db.session.query(Files.filepath).filter(or_(*(
+            and_(Files.folder == folder, Files.filename == name) for folder, name in candidates
+        ))).order_by(Files.id).limit(1).scalar()
 
         if not filepath:
             self.log_warning(f"File not found: {path}")

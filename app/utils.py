@@ -13,17 +13,44 @@ from typing import Optional, Tuple
 import os
 from constants import *
 
+def is_container_name(name):
+    """Whether a name carries one of the container extensions."""
+    return name.endswith(tuple(f'.{ext}' for ext in ALLOWED_EXTENSIONS))
+
+
+def is_archive_path(path):
+    """Whether a path is a RAR volume - for a Files row, whether it is served out of one."""
+    return str(path).lower().endswith('.rar')
+
+
+_RAR_PART_RE = re.compile(r'\.part(\d+)\.rar$', re.IGNORECASE)
+
+
+def is_rar_first_volume(name):
+    """Whether a name is the volume a RAR set is opened by.
+
+    New-style sets number every volume (`.part01.rar`, `.part02.rar`, ...) starting at 1.
+    Old-style sets keep the first volume in `.rar` and continue in `.r00`, `.r01`, ...,
+    which do not end in `.rar` at all.
+    """
+    if not name.lower().endswith('.rar'):
+        return False
+    match = _RAR_PART_RE.search(name)
+    return match is None or int(match.group(1)) == 1
+
+
 def is_library_file(name):
     """Whether a file name is one the library should index.
 
     Matches on extension, and rejects dotfiles: macOS leaves an AppleDouble `._Game.nsp`
     next to every file it copies onto a network share, which carries the extension but
-    holds Finder metadata rather than a container.
+    holds Finder metadata rather than a container. A RAR set is indexed by its first volume
+    only; the container it carries is served without being extracted.
     """
     name = os.path.basename(name)
     if name.startswith('.'):
         return False
-    return any(name.endswith(f'.{ext}') for ext in ALLOWED_EXTENSIONS)
+    return is_container_name(name) or is_rar_first_volume(name)
 
 # Shared log format used by the app, workers and the Gunicorn logger
 LOG_FORMAT = '[%(asctime)s.%(msecs)03d] %(levelname)s (%(module)s) %(message)s'

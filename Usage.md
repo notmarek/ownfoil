@@ -188,6 +188,15 @@ Add the directories containing your content here. The path has to already exist 
 
 Ownfoil scans a path as soon as you add it, looking for `nsp`, `nsz`, `xci` and `xcz` files. The arrows button on a row rescans that one path, and `Scan library` rescans all of them. If enabled, the file watcher below detects changes automatically.
 
+#### RAR archives
+
+Games can also stay packed in `rar` archives, single or split into volumes (`game.part01.rar`, `game.part02.rar`, ... or `game.rar`, `game.r00`, ...). Ownfoil lists the `nsp`/`nsz`/`xci`/`xcz` inside under its own name and decompresses it while it is being downloaded; nothing is ever extracted to disk. This needs `unrar` (or `unar`/`7z`) on the machine running Ownfoil, which the Docker image includes.
+
+- Archives are read-only: the organizer, verification and compression skip them. Deleting one from the Web UI deletes all of its volumes.
+- Each archive is indexed by its first volume and serves the first game it contains.
+- A compressed archive can only be read from the start. Ownfoil keeps a download's decompressor running between requests, so a client that downloads in consecutive pieces or resumes where it stopped continues it, but jumping back or far ahead means decompressing up to that point again. Identifying a game may also need to read through much of its archive once. Archives made in store mode (`rar -m0`) have neither cost.
+- Ownfoil reads an archive as soon as its first volume stops growing. If the other volumes were still being copied, the file shows an identification error: use `Identify again` on it in the Files page once the copy is done.
+
 ### File watcher
 
 | Setting | Default | Description |
