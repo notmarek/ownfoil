@@ -1,9 +1,9 @@
-"""Games kept in RAR archives: indexed by their first volume, served decompressed, never extracted.
+"""Games kept in RAR archives: indexed by their first volume, served out of a shared unpacking.
 
 The archives here are written by hand in store mode - no tool in CI can create a compressed
-one. rarfile reads a stored member by real seeks, so the stream mechanics a compressed member
-depends on (forward-only reads, a restart to go back) are covered with a fake reader, and the
-real `unrar` pipe by forcing it onto a stored member where the tool is installed.
+one. What serving a compressed member depends on (one forward-only unpacking shared by
+out-of-order reads) is covered with a fake reader, and the real `unrar` pipe by forcing it
+onto a stored member where the tool is installed.
 """
 import os
 import types
@@ -57,10 +57,10 @@ def _unrar_available():
 
 
 @pytest.fixture(autouse=True)
-def empty_pool():
-    archive.pool.clear()
+def empty_cache():
+    archive.cache.clear()
     yield
-    archive.pool.clear()
+    archive.cache.clear()
 
 
 # --- Which files the library indexes ---
@@ -135,7 +135,7 @@ def test_container_opens_through_the_archive(tmp_path):
         assert partition_entries(c) == expected
 
 
-# --- Stream reuse, against a reader that behaves like a compressed member ---
+# --- Serving, against a reader that behaves like a compressed member ---
 
 class FakeMember:
     """Forward-only like a decompressor: seeking back counts as a restart."""
@@ -164,61 +164,90 @@ class FakeMember:
 
 
 @pytest.fixture
-def fake_pool(monkeypatch):
+def fake_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("OWNFOIL_ARCHIVE_TMP", str(tmp_path))
     data = os.urandom(10_000)
     log = {"opens": 0, "restarts": 0}
-    pool = archive.StreamPool(opener=lambda path: FakeMember(data, log))
-    monkeypatch.setattr(archive, "pool", pool)
-    yield types.SimpleNamespace(data=data, log=log, pool=pool)
-    pool.clear()
+    cache = archive.ExtractionCache(opener=lambda path: FakeMember(data, log))
+    monkeypatch.setattr(archive, "cache", cache)
+    monkeypatch.setattr(archive, "CHUNK_SIZE", 1000)
+    yield types.SimpleNamespace(data=data, log=log, cache=cache, tmp=tmp_path)
+    cache.clear()
 
 
-def test_a_follow_up_range_resumes_the_parked_stream(fake_pool):
-    assert b"".join(archive.stream("a.rar", 0, 4000)) == fake_pool.data[:4000]
-    assert b"".join(archive.stream("a.rar", 4000, 6000)) == fake_pool.data[4000:6000]
-    assert b"".join(archive.stream("a.rar", 7000, 8000)) == fake_pool.data[7000:8000]
-    assert fake_pool.log == {"opens": 1, "restarts": 0}
+def test_out_of_order_ranges_share_one_unpacking(fake_cache):
+    data = fake_cache.data
+    assert b"".join(archive.stream("a.rar", 8000, 9000)) == data[8000:9000]
+    assert b"".join(archive.stream("a.rar", 0, 100)) == data[:100]
+    assert b"".join(archive.stream("a.rar", 5000, 10_000)) == data[5000:]
+    assert fake_cache.log == {"opens": 1, "restarts": 0}
 
 
-def test_a_range_behind_every_stream_starts_a_new_one(fake_pool):
-    b"".join(archive.stream("a.rar", 0, 4000))
-    assert b"".join(archive.stream("a.rar", 100, 200)) == fake_pool.data[100:200]
-    assert fake_pool.log == {"opens": 2, "restarts": 0}
+def test_archives_unpack_separately(fake_cache):
+    b"".join(archive.stream("a.rar", 0, 10))
+    b"".join(archive.stream("b.rar", 0, 10))
+    assert fake_cache.log["opens"] == 2
 
 
-def test_streams_are_not_shared_between_archives(fake_pool):
-    b"".join(archive.stream("a.rar", 0, 4000))
-    b"".join(archive.stream("b.rar", 4000, 5000))
-    assert fake_pool.log["opens"] == 2
+def test_concurrent_readers_share_one_unpacking(fake_cache):
+    import threading
+
+    results = {}
+
+    def get(start, stop):
+        results[start] = b"".join(archive.stream("a.rar", start, stop))
+
+    threads = [threading.Thread(target=get, args=(s, s + 1500)) for s in (0, 3000, 8000)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(results[s] == fake_cache.data[s:s + 1500] for s in (0, 3000, 8000))
+    assert fake_cache.log["opens"] == 1
 
 
-def test_an_unsent_body_starts_no_decompressor(fake_pool):
+def test_an_unsent_body_starts_no_unpacking(fake_cache):
     """HEAD builds the response but never iterates it."""
     archive.stream("a.rar", 0, 4000)
-    assert fake_pool.log["opens"] == 0
+    assert fake_cache.log["opens"] == 0
 
 
-def test_a_disconnect_parks_the_stream_where_it_got_to(fake_pool, monkeypatch):
-    monkeypatch.setattr(archive, "CHUNK_SIZE", 1000)
-    body = archive.stream("a.rar", 0, 10_000)
-    next(body)
-    body.close()
-    assert b"".join(archive.stream("a.rar", 1000, 2000)) == fake_pool.data[1000:2000]
-    assert fake_pool.log == {"opens": 1, "restarts": 0}
-
-
-def test_a_stream_at_the_end_is_not_parked(fake_pool):
+def test_the_unpacked_file_has_no_name(fake_cache):
     b"".join(archive.stream("a.rar", 0, 10_000))
-    assert fake_pool.pool._idle == []
+    if os.name == "posix":
+        assert os.listdir(fake_cache.tmp) == []
 
 
-def test_idle_streams_expire(fake_pool, monkeypatch):
+def test_idle_unpackings_expire(fake_cache, monkeypatch):
     b"".join(archive.stream("a.rar", 0, 10))
-    reader = fake_pool.pool._idle[0][1]
-    clock = archive.time.monotonic() + fake_pool.pool._ttl + 1
+    clock = archive.time.monotonic() + fake_cache.cache._ttl + 1
     monkeypatch.setattr(archive.time, "monotonic", lambda: clock)
+    fake_cache.cache._reap()
+    assert fake_cache.cache._entries == {}
     b"".join(archive.stream("a.rar", 0, 10))
-    assert reader.closed
+    assert fake_cache.log["opens"] == 2
+
+
+def test_the_cap_drops_idle_unpackings(fake_cache, monkeypatch):
+    monkeypatch.setenv("OWNFOIL_ARCHIVE_TMP_MAX_GB", str(5000 / (1 << 30)))
+    b"".join(archive.stream("a.rar", 0, 10_000))
+    b"".join(archive.stream("b.rar", 0, 10))
+    assert list(fake_cache.cache._entries) == ["b.rar"]
+
+
+def test_a_failed_unpacking_is_retried(fake_cache, monkeypatch):
+    calls = []
+
+    def flaky(path):
+        calls.append(path)
+        if len(calls) == 1:
+            raise IOError("volume missing")
+        return FakeMember(fake_cache.data, fake_cache.log)
+
+    monkeypatch.setattr(fake_cache.cache, "_opener", flaky)
+    with pytest.raises(IOError):
+        b"".join(archive.stream("a.rar", 0, 10))
+    assert b"".join(archive.stream("a.rar", 0, 10)) == fake_cache.data[:10]
 
 
 def test_cached_reader_revisits_without_restarting():
@@ -307,7 +336,7 @@ def test_head_reports_the_container_size(archived):
     resp = archived.shop.client.head(f"/api/download/{archived.token}")
     assert resp.status_code == 200
     assert int(resp.headers["Content-Length"]) == len(archived.data)
-    assert archive.pool._idle == []
+    assert archive.cache._entries == {}
 
 
 def test_sphaira_lists_and_serves_the_container(archived):

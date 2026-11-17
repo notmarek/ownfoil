@@ -1,23 +1,24 @@
-"""Library files kept inside RAR archives, read and served without ever being extracted.
+"""Library files kept inside RAR archives, read and served without extracting them in place.
 
 A RAR is indexed by its first volume and stands for the one NSP/NSZ/XCI/XCZ it carries: the
 Files row keeps the archive as `filepath` (what exists on disk, what the watcher reports) and
-the member as `filename`/`extension`/`size` (what clients are offered). Nothing is unpacked to
-disk - bytes come off `unrar p` through rarfile, straight into the reader or the response.
+the member as `filename`/`extension`/`size` (what clients are offered). Bytes come off
+`unrar p` through rarfile.
 
-Store-mode (-m0) members read by real seeks. A compressed member can only be read forward:
-reaching an offset means decompressing everything before it, and going back means starting
-over. Two layers keep that affordable:
+A compressed member can only be read forward: reaching an offset means decompressing
+everything before it. That decides how each consumer reads:
 
-- `StreamPool` parks a download's decompressor when its response ends, still positioned, so
-  a client fetching a file in consecutive ranges continues one stream instead of restarting
-  it per range.
-- `CachedReader` keeps recently read blocks, so the header walk identification does - which
-  revisits partition tables and NCA headers - mostly hits memory instead of rewinding.
+- Identification reads through `CachedReader`, which keeps recently read blocks: the header
+  walk revisits partition tables and NCA headers, and those mostly hit memory.
+- Downloads are served out of an `Extraction`: the member unpacked at full speed into an
+  anonymous temporary file, shared by every request for it. Installers read out of order and
+  give up on a read that stalls (Sphaira after 15s), so a request has to find the data
+  already unpacked, or the unpacking well on its way to it, instead of starting over.
 """
 import logging
 import os
 import threading
+import tempfile
 import time
 from collections import OrderedDict
 
@@ -165,80 +166,167 @@ class CachedReader:
         self._reader.close()
 
 
-class StreamPool:
-    """Idle, still-positioned member readers, so a follow-up range resumes where one ended.
+def _cache_dir():
+    """Where unpacked members live while served. Point it at a tmpfs to keep them in memory."""
+    return os.environ.get('OWNFOIL_ARCHIVE_TMP') or tempfile.gettempdir()
 
-    A reader is checked out by one response at a time. Taking one hands back the idle reader
-    for that archive furthest along without passing the wanted offset - skipping forward from
-    it never costs more than starting over. Readers idle past `ttl`, or beyond `max_idle` in
-    all, are closed.
+
+def _cache_limit():
+    """Bytes the unpacked members may take together, from OWNFOIL_ARCHIVE_TMP_MAX_GB; 0 = no cap."""
+    try:
+        return int(float(os.environ.get('OWNFOIL_ARCHIVE_TMP_MAX_GB', '0')) * (1 << 30))
+    except ValueError:
+        return 0
+
+
+class Extraction:
+    """One member being unpacked, at full speed, into an anonymous temporary file.
+
+    Reads are served out of the file as soon as the unpacking has got past them, so a client
+    jumping ahead waits for the unpacker instead of starting a decompressor of its own, and a
+    client retrying a read that timed out finds it further along. The file has no name on
+    disk (POSIX unlinks it at creation, Windows on close), so nothing outlives the process.
     """
 
-    def __init__(self, max_idle=8, ttl=120.0, opener=MemberReader):
+    def __init__(self, path, opener=MemberReader):
+        self.path = path
+        self._opener = opener
+        self._cond = threading.Condition()
+        self._file_lock = threading.Lock()
+        self._file = tempfile.TemporaryFile(dir=_cache_dir(), prefix='ownfoil-')
+        self.size = None
+        self.done = 0
+        self.error = None
+        self.users = 0
+        self.last_used = time.monotonic()
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, name=f'unrar {os.path.basename(path)}',
+                                        daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        reader = None
+        try:
+            reader = self._opener(self.path)
+            with self._cond:
+                self.size = reader.size
+                self._cond.notify_all()
+            while not self._stop:
+                data = reader.read(CHUNK_SIZE)
+                if not data:
+                    break
+                with self._file_lock:
+                    self._file.seek(self.done)
+                    self._file.write(data)
+                    self._file.flush()
+                with self._cond:
+                    self.done += len(data)
+                    self._cond.notify_all()
+            if not self._stop and self.done != self.size:
+                raise IOError(f'Archive member ended early at {self.done} of {self.size} bytes')
+            if not self._stop:
+                logger.info(f'Unpacked {os.path.basename(self.path)} ({self.done} bytes)')
+        except Exception as e:
+            logger.error(f'Unpacking {self.path} failed: {e}')
+            with self._cond:
+                self.error = e
+                self._cond.notify_all()
+        finally:
+            if reader is not None:
+                _close_quietly(reader)
+
+    def read(self, offset, size):
+        """Up to `size` bytes at `offset`, waiting until the unpacker has reached them."""
+        with self._cond:
+            while self.done <= offset and self.error is None and not self._stop:
+                self._cond.wait()
+            if self.done <= offset:
+                raise IOError(f'Cannot read {self.path}: {self.error or "unpacking stopped"}')
+            size = min(size, self.done - offset)
+        with self._file_lock:
+            self._file.seek(offset)
+            return self._file.read(size)
+
+    def wait_size(self):
+        with self._cond:
+            while self.size is None and self.error is None:
+                self._cond.wait()
+            if self.error is not None and self.size is None:
+                raise IOError(f'Cannot read {self.path}: {self.error}')
+            return self.size
+
+    def close(self):
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+        self._thread.join(timeout=30)
+        with self._file_lock:
+            self._file.close()
+
+
+class ExtractionCache:
+    """The members being served, one Extraction each, dropped once idle for `ttl` seconds.
+
+    Kept past the end of a download so that the reads an installer comes back for - and the
+    retries of reads it gave up on - are answered from the file instead of unpacked again.
+    """
+
+    def __init__(self, ttl=600.0, opener=MemberReader):
         self._lock = threading.Lock()
-        self._idle = []  # [(path, reader, parked_at)]
-        self._max_idle = max_idle
+        self._entries = {}
         self._ttl = ttl
         self._opener = opener
         self._reaper = None
 
-    def take(self, path, offset):
-        with self._lock:
-            stale = self._expire_locked()
-            best = None
-            for i, (p, reader, _) in enumerate(self._idle):
-                if p != path:
-                    continue
-                pos = reader.tell()
-                if pos <= offset and (best is None or pos > self._idle[best][1].tell()):
-                    best = i
-            reader = self._idle.pop(best)[1] if best is not None else None
-        for r in stale:
-            _close_quietly(r)
-        if reader is None:
-            reader = self._opener(path)
-        if reader.tell() != offset:
-            try:
-                reader.seek(offset)
-            except Exception:
-                _close_quietly(reader)
-                raise
-        return reader
-
-    def give(self, path, reader):
-        if reader.tell() >= reader.size:
-            # Nothing follows the end of a member: no later range can resume this one.
-            _close_quietly(reader)
-            return
+    def acquire(self, path):
         stale = []
         with self._lock:
-            self._idle.append((path, reader, time.monotonic()))
-            stale += self._expire_locked()
-            while len(self._idle) > self._max_idle:
-                stale.append(self._idle.pop(0)[1])
+            entry = self._entries.get(path)
+            if entry is not None and entry.error is not None:
+                stale.append(self._entries.pop(path))
+                entry = None
+            if entry is None:
+                stale += self._make_room_locked()
+                entry = self._entries[path] = Extraction(path, self._opener)
+            entry.users += 1
+            entry.last_used = time.monotonic()
             self._arm_reaper_locked()
-        for r in stale:
-            _close_quietly(r)
+        for e in stale:
+            e.close()
+        return entry
+
+    def release(self, entry):
+        with self._lock:
+            entry.users -= 1
+            entry.last_used = time.monotonic()
 
     def clear(self):
         with self._lock:
-            idle, self._idle = self._idle, []
-        for _, reader, _ in idle:
-            _close_quietly(reader)
+            entries, self._entries = list(self._entries.values()), {}
+        for e in entries:
+            e.close()
+
+    def _make_room_locked(self):
+        """Drop idle extractions, oldest first, while the cap is reached."""
+        limit = _cache_limit()
+        if not limit:
+            return []
+        dropped = []
+        idle = sorted((e for e in self._entries.values() if e.users == 0), key=lambda e: e.last_used)
+        while idle and sum(e.done for e in self._entries.values()) >= limit:
+            e = idle.pop(0)
+            dropped.append(self._entries.pop(e.path))
+        return dropped
 
     def _expire_locked(self):
         now = time.monotonic()
-        keep, stale = [], []
-        for entry in self._idle:
-            (keep if now - entry[2] < self._ttl else stale).append(entry)
-        self._idle = keep
-        return [reader for _, reader, _ in stale]
+        stale = [p for p, e in self._entries.items() if e.users == 0 and now - e.last_used >= self._ttl]
+        return [self._entries.pop(p) for p in stale]
 
     def _arm_reaper_locked(self):
-        # Idle readers each hold an unrar process; without traffic nothing else would end them.
-        if self._reaper is not None or not self._idle:
+        if self._reaper is not None or not self._entries:
             return
-        self._reaper = threading.Timer(self._ttl, self._reap)
+        self._reaper = threading.Timer(min(self._ttl, 60.0), self._reap)
         self._reaper.daemon = True
         self._reaper.start()
 
@@ -247,8 +335,9 @@ class StreamPool:
             self._reaper = None
             stale = self._expire_locked()
             self._arm_reaper_locked()
-        for r in stale:
-            _close_quietly(r)
+        for e in stale:
+            logger.debug(f'Dropping unpacked {e.path}')
+            e.close()
 
 
 def _close_quietly(reader):
@@ -258,32 +347,21 @@ def _close_quietly(reader):
         logger.debug(f'Error closing archive reader for {getattr(reader, "path", "?")}: {e}')
 
 
-pool = StreamPool()
+cache = ExtractionCache()
 
 
 def stream(path, start, stop):
-    """Yield bytes [start, stop) of the member in `path`, parking the reader when done.
+    """Yield bytes [start, stop) of the member in `path`, out of its shared extraction.
 
-    The reader is taken on first iteration, so a response whose body is never sent (HEAD)
-    starts no decompressor. A client that disconnects mid-range still parks its reader at
-    wherever it got to - its retry is usually a range starting right there.
+    The extraction is acquired on first iteration, so a response whose body is never sent
+    (HEAD) starts no unpacking.
     """
-    reader = pool.take(path, start)
-    healthy = False
+    entry = cache.acquire(path)
     try:
-        remaining = stop - start
-        while remaining > 0:
-            data = reader.read(min(CHUNK_SIZE, remaining))
-            if not data:
-                raise IOError(f'Archive member ended early: {path}')
-            remaining -= len(data)
+        pos = start
+        while pos < stop:
+            data = entry.read(pos, min(CHUNK_SIZE, stop - pos))
+            pos += len(data)
             yield data
-        healthy = True
-    except GeneratorExit:
-        healthy = True
-        raise
     finally:
-        if healthy:
-            pool.give(path, reader)
-        else:
-            _close_quietly(reader)
+        cache.release(entry)

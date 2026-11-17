@@ -190,11 +190,18 @@ Ownfoil scans a path as soon as you add it, looking for `nsp`, `nsz`, `xci` and 
 
 #### RAR archives
 
-Games can also stay packed in `rar` archives, single or split into volumes (`game.part01.rar`, `game.part02.rar`, ... or `game.rar`, `game.r00`, ...). Ownfoil lists the `nsp`/`nsz`/`xci`/`xcz` inside under its own name and decompresses it while it is being downloaded; nothing is ever extracted to disk. This needs `unrar` (or `unar`/`7z`) on the machine running Ownfoil, which the Docker image includes.
+Games can also stay packed in `rar` archives, single or split into volumes (`game.part01.rar`, `game.part02.rar`, ... or `game.rar`, `game.r00`, ...). Ownfoil lists the `nsp`/`nsz`/`xci`/`xcz` inside under its own name, and serves it without ever extracting it next to the archive. This needs `unrar` (or `unar`/`7z`) on the machine running Ownfoil, which the Docker image includes.
+
+When a game is first requested, Ownfoil unpacks it at full speed into an anonymous temporary file and answers every request for it from there as soon as the unpacking has reached the requested part. Installers read a game out of order and give up on a read that stalls, so they must not each wait for their own decompression. The file is dropped 10 minutes after the last request, and has no name on disk, so nothing is left behind if Ownfoil stops.
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `OWNFOIL_ARCHIVE_TMP` | the system temp directory | Where the unpacked games are kept while served. A tmpfs keeps them in memory: in Docker, `/tmp` is on the container's disk unless you mount one, e.g. `tmpfs: - /tmp:size=32g` in Compose. |
+| `OWNFOIL_ARCHIVE_TMP_MAX_GB` | no limit | When reached, games no client is downloading are dropped before another one is unpacked. |
 
 - Archives are read-only: the organizer, verification and compression skip them. Deleting one from the Web UI deletes all of its volumes.
 - Each archive is indexed by its first volume and serves the first game it contains.
-- A compressed archive can only be read from the start. Ownfoil keeps a download's decompressor running between requests, so a client that downloads in consecutive pieces or resumes where it stopped continues it, but jumping back or far ahead means decompressing up to that point again. Identifying a game may also need to read through much of its archive once. Archives made in store mode (`rar -m0`) have neither cost.
+- Identifying a compressed archive reads through it without the temporary file, and may need to decompress most of it once. Archives made in store mode (`rar -m0`) identify instantly.
 - Ownfoil reads an archive as soon as its first volume stops growing. If the other volumes were still being copied, the file shows an identification error: use `Identify again` on it in the Files page once the copy is done.
 
 ### File watcher
